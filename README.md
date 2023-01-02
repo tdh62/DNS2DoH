@@ -10,7 +10,7 @@
 
 ## Usage
 
-直接运行即可将请求转发至 DNSPoD 公共解析的 DoH 服务（https://1.12.12.12/dns-query)，
+直接运行即可将请求转发至 阿里云 公共解析的 DoH 服务（https://223.5.5.5/dns-query)，
 也可手动指定要连接的 DoH 服务端
 
 DNS2DoH doHEndpoint
