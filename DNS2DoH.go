@@ -30,6 +30,7 @@ type Config struct {
 	ForwardTo     string // "DoH"
 	EndPoint      string // "dns.pub"
 	ServerName    string // "dns.pub"
+	ParseRequest  bool
 }
 
 var config = Config{
@@ -41,6 +42,7 @@ var config = Config{
 	ForwardTo:     "DoH",
 	EndPoint:      "dns.pub",
 	ServerName:    "dns.pub",
+	ParseRequest:  true,
 }
 
 // loadConfig load the config from command line or config.json file
@@ -56,6 +58,8 @@ func loadConfig() {
 		"server, if use DoH, Please input the FULL address, including 'https://' and path such as '/dns-query'.")
 	flag.StringVar(&config.ServerName, "sni", "", "For TLS handshake, If empty the vitrify of TLS will"+
 		" be disabled.")
+	//flag.BoolVar(&config.ParseRequest, "parse", false, "Parse the request and response."+
+	//	"It's useless now because not cache or setter live.")
 	flag.Parse()
 	if *notcp {
 		config.ListenTCP = false
@@ -219,19 +223,38 @@ func handleUDPConn(con *net.UDPConn) {
 			continue
 		}
 
+		if config.ParseRequest {
+			d, _ := parseDomain(buf[12:ri])
+			t := binary.BigEndian.Uint16(buf[ri-4 : ri-2])
+			var tp string
+			switch t {
+			case 0x01:
+				tp = "IPv4(A)"
+			case 0x1c:
+				tp = "IPv6(AAAA)"
+			default:
+				tp = "other"
+			}
+			log.Printf("Forwarding request %s %s address.", d, tp)
+		}
 		// Forward response
-		switch config.ForwardTo {
-		case "DoH":
-			_, err = con.WriteToUDP(doDoHRequest(buf[:ri]), rmt)
-		case "DoT":
-			_, err = con.WriteToUDP(doDoTRequest(buf[:ri]), rmt)
-		default:
-			panic("Error forward target.")
-		}
+		go forwardToUDP(con, buf[:ri], rmt)
 
-		if err != nil {
-			log.Println(err)
-		}
+	}
+}
+
+func forwardToUDP(con *net.UDPConn, buf []byte, rmt *net.UDPAddr) {
+	var err error
+	switch config.ForwardTo {
+	case "DoH":
+		_, err = con.WriteToUDP(doDoHRequest(buf), rmt)
+	case "DoT":
+		_, err = con.WriteToUDP(doDoTRequest(buf), rmt)
+	default:
+		panic("Error forward target.")
+	}
+	if err != nil {
+		log.Println(err)
 	}
 }
 
@@ -332,4 +355,28 @@ func doDoTRequest(buf []byte) []byte {
 	}
 
 	return rbuf[2:ri]
+}
+
+func parseDomain(rbuf []byte) (string, int) {
+	domain := ""
+	offset := 0
+
+	for {
+		if rbuf[offset] == 0 {
+			offset += 1
+			return domain[:len(domain)-1], offset
+		} else if rbuf[offset]&0xc0 == 0xc0 {
+			// Pointer
+			p := binary.BigEndian.Uint16(rbuf[offset:offset+2]) & 0x3fff
+			d, _ := parseDomain(rbuf[p:])
+			domain += d
+			offset += 2
+			return domain[:len(domain)-1], offset
+		} else {
+			// domain
+			l := int(rbuf[offset])
+			domain += string(rbuf[offset+1:offset+1+l]) + "."
+			offset += l + 1
+		}
+	}
 }
