@@ -15,6 +15,12 @@ import (
 	"time"
 )
 
+const (
+	Version = "v1.2"
+	License = "MIT License"
+	TimeOut = time.Second * 30
+)
+
 type Config struct {
 	ListenAddress string //  "" // listen address
 	ListenTCP     bool   // true
@@ -36,8 +42,6 @@ var config = Config{
 	EndPoint:      "dns.pub",
 	ServerName:    "dns.pub",
 }
-
-var DoHEndPoint = "https://1.12.12.12/dns-query"
 
 // loadConfig load the config from command line or config.json file
 func loadConfig() {
@@ -66,9 +70,15 @@ func loadConfig() {
 		}
 		config.EndPoint = parse.String()
 	}
+	if config.ForwardTo == "DoT" {
+		if strings.Index(config.EndPoint, ":") < 0 {
+			config.EndPoint += ":853"
+		}
+	}
 }
 
 func main() {
+	log.Println("DNS2DoH version", Version, ",Following", License)
 	loadConfig()
 
 	// start listener
@@ -76,13 +86,13 @@ func main() {
 	tcpChan := make(chan struct{})
 	var listener int
 	if config.ListenUDP {
-		log.Println("Start UDP Listener")
+		log.Println("Starting UDP Listener")
 		listener++
 		go UDPListener(udpChan)
 	}
 
 	if config.ListenTCP {
-		log.Println("Start TCP Listener")
+		log.Println("Starting TCP Listener")
 		listener++
 		go TCPListener(tcpChan)
 	}
@@ -140,10 +150,16 @@ func TCPListener(down chan struct{}) {
 	down <- struct{}{}
 }
 
+// setConnTimeout to set the deadline of connection
+func setConnTimeout(con net.Conn, timeout time.Duration) {
+	_ = net.Conn.SetDeadline(con, time.Now().Add(timeout))
+}
+
 func handleTCPConn(con net.Conn) {
 	for {
 		// Set/Update timeout
-		_ = net.Conn.SetDeadline(con, time.Now().Add(time.Second*30))
+		setConnTimeout(con, TimeOut)
+
 		buf := make([]byte, 2048)
 		ri, err := con.Read(buf)
 		if err != nil {
@@ -228,7 +244,7 @@ func doDoHRequest(buf []byte) []byte {
 
 	// build HTTP GET request
 	c := http.Client{}
-	r, err := http.NewRequest(http.MethodGet, DoHEndPoint+"?dns="+b64req, nil)
+	r, err := http.NewRequest(http.MethodGet, config.EndPoint+"?dns="+b64req, nil)
 	if err != nil {
 		log.Println(err)
 		return nil
@@ -239,6 +255,7 @@ func doDoHRequest(buf []byte) []byte {
 		log.Println(err)
 		return nil
 	}
+
 	// Do GET request and read response
 	sbuf := make([]byte, resp.ContentLength)
 	if resp.StatusCode != 200 {
@@ -271,11 +288,7 @@ func doDoTRequest(buf []byte) []byte {
 	nbuf := addLen(buf)
 
 	// dial DoT server
-	t := config.EndPoint
-	if strings.Index(config.EndPoint, ":") < 0 {
-		t += ":853"
-	}
-	n, err := net.Dial("tcp", t)
+	n, err := net.Dial("tcp", config.EndPoint)
 	if err != nil {
 		log.Println(err)
 		return nil
@@ -296,9 +309,10 @@ func doDoTRequest(buf []byte) []byte {
 	if err != nil {
 		return nil
 	}
-	_ = net.Conn.SetDeadline(tn, time.Now().Add(time.Second*20))
+	setConnTimeout(tn, TimeOut)
 	bytesBuffer := bytes.NewBuffer(rbuf)
 	var x int16
+
 	err = binary.Read(bytesBuffer, binary.BigEndian, &x)
 	if err != nil {
 		return nil
