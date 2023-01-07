@@ -8,6 +8,7 @@
 [o] 转发请求和响应 - DoH
 [o] 转发请求和响应 - DoT
 [o] 处理 TCP 拆包
+[o] 命令行自定义参数
 [ ] 缓存请求、解析
 [ ] 自定义解析返回
 [ ] 处理 TCP 粘包
@@ -30,14 +31,25 @@
     ServerName    = "dns.pub" // DoT 域名，若留空则忽略 DoT 的 TLS 验证
 ```
 
-## Quick Start
+## 用法
 
-直接运行即可将请求转发至 DNSPod 公共解析的 DoH 服务（https://1.12.12.12/dns-query)，
-也可手动指定要连接的 DoH 服务端
-
-DNS2DoH doHEndpoint
-
-example:
-```shell
-./DNS2DoH https://1.12.12.12/dns-query
 ```
+.\DNS2DoH.exe
+    -e string
+        Set Target of DoH or DoT server, if use DoH, Please input the FULL address, including 'https://' and path such as '/dns-query'. (default "https://1.12.12.12/dns-query")
+    -ip string
+        Define the listen address (default "127.0.0.1")
+    -notcp
+        Disable listen on TCP
+    -noudp
+        Disable listen on UDP
+    -port int
+        Set listen port on TCP. (default 53)
+    -sni string
+        For TLS handshake, If empty the vitrify of TLS will be disabled.
+    -to string
+        Only 'DoH' or 'DoT' can be use to define wherever the data froward to. (default "DoH")
+    -udpport int
+        Set listen port on UDP. (default 53)
+```
+

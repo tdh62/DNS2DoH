@@ -5,44 +5,89 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"flag"
 	"log"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const (
-	listenAddress = "" // listen address
-	listenPort    = 53 // port
-	listenUDP     = true
-	listenTCP     = true
-	forwardTo     = "DoH" // DoH or DoT can be used
-	DoTEndPoint   = "dns.pub"
-	ServerName    = "dns.pub"
-)
+type Config struct {
+	ListenAddress string //  "" // listen address
+	ListenTCP     bool   // true
+	TCPPort       int    //  53 // port
+	ListenUDP     bool   // true
+	UDPPort       int    //  53 // port
+	ForwardTo     string // "DoH"
+	EndPoint      string // "dns.pub"
+	ServerName    string // "dns.pub"
+}
+
+var config = Config{
+	ListenAddress: "",
+	ListenTCP:     true,
+	TCPPort:       53,
+	ListenUDP:     true,
+	UDPPort:       53,
+	ForwardTo:     "DoH",
+	EndPoint:      "dns.pub",
+	ServerName:    "dns.pub",
+}
 
 var DoHEndPoint = "https://1.12.12.12/dns-query"
 
-func main() {
-	// Read param from command line
-	a := os.Args[1:]
-	if len(a) >= 1 {
-		DoHEndPoint = os.Args[1]
+// loadConfig load the config from command line or config.json file
+func loadConfig() {
+	flag.StringVar(&config.ListenAddress, "ip", "127.0.0.1", "Define the listen address")
+	notcp := flag.Bool("notcp", false, "Disable listen on TCP")
+	noudp := flag.Bool("noudp", false, "Disable listen on UDP")
+	flag.IntVar(&config.TCPPort, "port", 53, "Set listen port on TCP.")
+	flag.IntVar(&config.UDPPort, "udpport", 53, "Set listen port on UDP.")
+	flag.StringVar(&config.ForwardTo, "to", "DoH", "Only 'DoH' or 'DoT' can be use to define wherever "+
+		"the data froward to.")
+	flag.StringVar(&config.EndPoint, "e", "https://1.12.12.12/dns-query", "Set Target of DoH or DoT "+
+		"server, if use DoH, Please input the FULL address, including 'https://' and path such as '/dns-query'.")
+	flag.StringVar(&config.ServerName, "sni", "", "For TLS handshake, If empty the vitrify of TLS will"+
+		" be disabled.")
+	flag.Parse()
+	if *notcp {
+		config.ListenTCP = false
 	}
+	if *noudp {
+		config.ListenUDP = false
+	}
+	if config.ForwardTo == "DoH" {
+		parse, err := url.Parse(config.EndPoint)
+		if err != nil {
+			log.Fatal(err)
+		}
+		config.EndPoint = parse.String()
+	}
+}
+
+func main() {
+	loadConfig()
+
+	// start listener
 	udpChan := make(chan struct{})
 	tcpChan := make(chan struct{})
 	var listener int
-	if listenUDP {
+	if config.ListenUDP {
+		log.Println("Start UDP Listener")
 		listener++
 		go UDPListener(udpChan)
 	}
-	if listenTCP {
+
+	if config.ListenTCP {
+		log.Println("Start TCP Listener")
 		listener++
 		go TCPListener(tcpChan)
 	}
+
+	// wait listener down
 	for listener > 0 {
 		select {
 		case <-udpChan:
@@ -58,7 +103,7 @@ func main() {
 
 // UDPListener Build UDP listener
 func UDPListener(down chan struct{}) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(listenAddress).To4(), Port: listenPort})
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(config.ListenAddress).To4(), Port: config.UDPPort})
 	if err != nil {
 		log.Println(err)
 		down <- struct{}{}
@@ -74,7 +119,7 @@ func UDPListener(down chan struct{}) {
 }
 
 func TCPListener(down chan struct{}) {
-	conn, err := net.Listen("tcp", listenAddress+":"+strconv.Itoa(listenPort))
+	conn, err := net.Listen("tcp", config.ListenAddress+":"+strconv.Itoa(config.TCPPort))
 	if err != nil {
 		log.Println(err)
 		down <- struct{}{}
@@ -126,7 +171,7 @@ func handleTCPConn(con net.Conn) {
 			return
 		}
 
-		switch forwardTo {
+		switch config.ForwardTo {
 		case "DoH":
 			_, err = con.Write(addLen(doDoHRequest(buf[2:ri])))
 		case "DoT":
@@ -159,7 +204,7 @@ func handleUDPConn(con *net.UDPConn) {
 		}
 
 		// Forward response
-		switch forwardTo {
+		switch config.ForwardTo {
 		case "DoH":
 			_, err = con.WriteToUDP(doDoHRequest(buf[:ri]), rmt)
 		case "DoT":
@@ -226,8 +271,8 @@ func doDoTRequest(buf []byte) []byte {
 	nbuf := addLen(buf)
 
 	// dial DoT server
-	t := DoTEndPoint
-	if strings.Index(DoTEndPoint, ":") < 0 {
+	t := config.EndPoint
+	if strings.Index(config.EndPoint, ":") < 0 {
 		t += ":853"
 	}
 	n, err := net.Dial("tcp", t)
@@ -238,7 +283,7 @@ func doDoTRequest(buf []byte) []byte {
 	defer func(n net.Conn) {
 		_ = n.Close()
 	}(n)
-	tn := parseTLS(n, ServerName == "", ServerName)
+	tn := parseTLS(n, config.ServerName == "", config.ServerName)
 
 	// Send Request and receive response
 	_, err = tn.Write(nbuf)
