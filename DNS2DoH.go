@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,62 @@ const (
 	License = "MIT License"
 	TimeOut = time.Second * 30
 )
+
+type Cache struct {
+	c   sync.Map
+	cnt int
+}
+
+type DNSCacheKey struct {
+	domain string
+	v6     bool // true for IPv6, false for IPv4
+}
+
+// DNSCache cache
+type DNSCache struct {
+	AList  [][]byte
+	Expiry int64
+}
+
+func (c *Cache) clean() {
+	c.c.Range(func(key, value interface{}) bool {
+		if c.cnt > config.MaxCache {
+			c.c.Delete(key)
+			c.cnt--
+		}
+		return true
+	})
+}
+
+func (c *Cache) Set(key DNSCacheKey, value [][]byte, duration int) {
+	exp := time.Now().Add(time.Second * time.Duration(duration)).Unix()
+	c.c.Store(key, DNSCache{AList: value, Expiry: exp})
+	c.cnt++
+	if config.MaxCache > 0 {
+		if c.cnt > config.MaxCache {
+			c.clean()
+		}
+	}
+}
+
+func (c *Cache) Get(key DNSCacheKey) ([][]byte, bool) {
+	var empty interface{}
+	empty = key
+	entry, ok := c.c.Load(empty)
+	if !ok {
+		return nil, false
+	}
+	e, ok := entry.(DNSCache)
+	if !ok {
+		return nil, false
+	}
+	if e.Expiry < time.Now().Unix() {
+		c.c.Delete(key)
+		c.cnt--
+		return nil, false
+	}
+	return e.AList, true
+}
 
 type DNSHeader struct {
 	ID      uint16 // Request ID
@@ -77,7 +134,7 @@ func (t *Trie) hasSuffix(s string) bool {
 	p := t
 	for _, r := range s {
 		if _, ok := p.Child[r]; ok == false {
-			return p.IsEnd
+			return false
 		}
 		p = p.Child[r]
 		if p.IsEnd == true {
@@ -102,6 +159,8 @@ type Config struct {
 	ServerName    string // "dns.pub"
 	ParseRequest  bool
 	BanList       Trie
+	MaxCache      int
+	CacheExpiry   int // cache time (s)
 }
 
 var config = Config{
@@ -111,11 +170,15 @@ var config = Config{
 	ListenUDP:     true,
 	UDPPort:       53,
 	ForwardTo:     "DoH",
-	EndPoint:      "dns.pub",
+	EndPoint:      "https://1.12.12.12/dns-query",
 	ServerName:    "dns.pub",
 	ParseRequest:  true,
 	BanList:       *NewTrie(),
+	MaxCache:      1000 * 8,
+	CacheExpiry:   600,
 }
+
+var cache Cache = Cache{cnt: 0}
 
 func main() {
 	log.Println("DNS2DoH version", Version, ",Following", License)
@@ -161,12 +224,14 @@ func loadConfig() {
 	flag.IntVar(&config.UDPPort, "udpport", 53, "Set listen port on UDP.")
 	flag.StringVar(&config.ForwardTo, "to", "DoH", "Only 'DoH' or 'DoT' can be use to define wherever "+
 		"the data froward to.")
-	flag.StringVar(&config.EndPoint, "e", "https://doh.pub/dns-query", "Set Target of DoH or DoT "+
+	flag.StringVar(&config.EndPoint, "e", "https://1.12.12.12/dns-query", "Set Target of DoH or DoT "+
 		"server, if use DoH, Please input the FULL address, including 'https://' and path such as '/dns-query'.")
 	flag.StringVar(&config.ServerName, "sni", "", "For TLS handshake, If empty the vitrify of TLS will"+
 		" be disabled.")
 	//flag.BoolVar(&config.ParseRequest, "parse", false, "Parse the request and response."+
 	//	"It's useless now because not cache or setter live.")
+	flag.IntVar(&config.MaxCache, "maxcache", 4*1000, "The max value of cache.")
+	flag.IntVar(&config.CacheExpiry, "cachetime", 3600, "The max value of cache(s).")
 	flag.Parse()
 	if *notcp {
 		config.ListenTCP = false
@@ -198,6 +263,7 @@ func loadBanList() {
 		log.Println(err)
 		return
 	}
+	defer fi.Close()
 	rd := bufio.NewReader(fi)
 
 	for {
@@ -206,7 +272,11 @@ func loadBanList() {
 			log.Println(err)
 			return
 		}
+
 		for {
+			if len(ln) == 0 {
+				break
+			}
 			if ln[len(ln)-1] == 10 {
 				ln = ln[:len(ln)-1]
 			} else if ln[len(ln)-1] == 13 {
@@ -246,6 +316,64 @@ func UDPListener(down chan struct{}) {
 	down <- struct{}{}
 }
 
+func BanOrCache(rbuf []byte) ([]byte, bool) {
+	if config.ParseRequest {
+		parseRequest(rbuf[:])
+		d, dlen := parseDomain(rbuf, 12)
+		ri := len(rbuf)
+		baned := banCheck(d)
+		if baned {
+			// set QR as response and return
+			rbuf[2] = rbuf[2] | 0x80 // 1000 0000 just set QR to 1 (response)
+			return rbuf, true
+		}
+
+		// search cache
+		t := binary.BigEndian.Uint16(rbuf[ri-4 : ri-2])
+		var k DNSCacheKey
+		if t == 0x1c {
+			// AAAA request
+			k = DNSCacheKey{
+				domain: d,
+				v6:     true,
+			}
+		} else if t == 0x01 {
+			// A request
+			k = DNSCacheKey{
+				domain: d,
+				v6:     false,
+			}
+		} else {
+			// just A or AAAA can be cached
+			return nil, false
+		}
+		cacheData, ok := cache.Get(k)
+		if ok == false {
+			return nil, false
+		}
+		al := uint16(len(cacheData))
+		// build DNS response
+		bb := bytes.NewBuffer([]byte{})
+
+		// DNSHeader
+		rl := 0
+		rbuf[2] = rbuf[2] | 0x80
+		bb.Write(rbuf[0:4])                        // DNSHeader
+		bb.Write([]byte{0, 1})                     // QDCount
+		_ = binary.Write(bb, binary.BigEndian, al) // QDCount
+		bb.Write([]byte{0, 0})                     // NSCount
+		bb.Write([]byte{0, 0})                     // ARCount
+		bb.Write(rbuf[12 : 12+dlen+4])             //Question
+		rl += 12 + dlen + 4
+		for _, al := range cacheData {
+			bb.Write(al)
+			rl += len(al)
+		}
+		return bb.Bytes(), true
+	}
+	return nil, false
+}
+
 // handleUDPConn Handle UDP DNS request
 func handleUDPConn(con *net.UDPConn) {
 	for {
@@ -256,23 +384,14 @@ func handleUDPConn(con *net.UDPConn) {
 			log.Println(err)
 			continue
 		}
-
-		if config.ParseRequest {
-			parseRequest(buf[:ri])
-			d, _ := parseDomain(buf[12:ri])
-			//t := binary.BigEndian.Uint16(buf[ri-4 : ri-2])
-			d = reverseString(d)
-			baned := banCheck(d)
-			if baned {
-				// set QR as response and return
-				buf[2] = buf[2] | 0x80 // 1000 0000 just set QR to 1 (response)
-				go func() {
-					_, _ = con.WriteToUDP(buf[:ri], rmt)
-				}()
-				continue
-			}
-
+		hit, ok := BanOrCache(buf[:ri])
+		if ok {
+			go func() {
+				_, _ = con.WriteToUDP(hit, rmt)
+			}()
+			continue
 		}
+
 		// Forward response
 		go forwardToUDP(con, buf[:ri], rmt)
 	}
@@ -346,6 +465,12 @@ func handleTCPConn(con net.Conn) {
 			log.Println("Error request message len.")
 			return
 		}
+		hit, ok := BanOrCache(buf[:ri])
+		if ok {
+			// build tcp response
+			log.Println(hit)
+			continue
+		}
 
 		switch config.ForwardTo {
 		case "DoH":
@@ -368,9 +493,8 @@ func addLen(buf []byte) []byte {
 	return nbuf
 }
 
-func banCheck(revd_d string) bool {
-	revd_d = reverseString(revd_d)
-	if config.BanList.hasSuffix(revd_d) {
+func banCheck(d string) bool {
+	if config.BanList.hasSuffix(d) {
 		return true
 	} else {
 		return false
@@ -401,12 +525,21 @@ func doDoHRequest(buf []byte) []byte {
 	// Do GET request and read response
 	sbuf := make([]byte, resp.ContentLength)
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == 502 {
+			d, _ := parseDomain(buf, 12)
+			if d != "" {
+				config.BanList.Insert(d)
+				_ = appendToFile("ban.txt", d+"\n")
+			}
+		}
 		log.Println(resp.Body)
+		return nil
 	}
 	ri, err := resp.Body.Read(sbuf)
 	if err != nil {
 		log.Println(err)
 	}
+	saveToCahce(sbuf[:ri])
 	return sbuf[:ri]
 }
 
@@ -488,26 +621,34 @@ func parseRequest(rbuf []byte) {
 	var req DNSRequest
 	parseHeader(rbuf, &req.HD)
 	var o int
-	req.Domain, o = parseDomain(rbuf[12:])
+	req.Domain, o = parseDomain(rbuf, 12)
 	req.QType = binary.BigEndian.Uint16(rbuf[12+o : 12+o+2])
 	req.QClass = binary.BigEndian.Uint16(rbuf[12+o+2 : 12+o+4])
 }
 
-func parseDomain(rbuf []byte) (string, int) {
+func parseDomain(rbuf []byte, offset int) (string, int) {
+	rof := offset
 	domain := ""
-	offset := 0
-
+	defer func() {
+		if e := recover(); e != nil {
+			log.Println(e)
+			log.Println("Unable to parse domain", domain)
+		}
+	}()
 	for {
 		if rbuf[offset] == 0 {
 			offset += 1
-			return domain[:len(domain)-1], offset
+			if domain[len(domain)-1] == '.' {
+				domain = domain[:len(domain)-1]
+			}
+			return domain, offset - rof
 		} else if rbuf[offset]&0xc0 == 0xc0 {
 			// Pointer
 			p := binary.BigEndian.Uint16(rbuf[offset:offset+2]) & 0x3fff
-			d, _ := parseDomain(rbuf[p:])
+			d, _ := parseDomain(rbuf, int(p))
 			domain += d
 			offset += 2
-			return domain[:len(domain)-1], offset
+			return domain, offset - rof
 		} else {
 			// domain
 			l := int(rbuf[offset])
@@ -517,14 +658,65 @@ func parseDomain(rbuf []byte) (string, int) {
 	}
 }
 
-//func parseAnswer(fullbuf []byte, offset int, ANCOUNT int) {
-//	for i := 0; i < int(ANCOUNT); i++ {
-//		domain, offset := parseDomain(fullbuf[offset:])                    // 解析域名
-//		qType := binary.BigEndian.Uint16(fullbuf[offset : offset+2])       // 请求类型
-//		qClass := binary.BigEndian.Uint16(fullbuf[offset+2 : offset+4])    // 请求类
-//		ttl := binary.BigEndian.Uint32(fullbuf[offset+4 : offset+8])       // TTL
-//		rdLength := binary.BigEndian.Uint16(fullbuf[offset+8 : offset+10]) // 资源记录数据长度
-//		rData := fullbuf[offset+10 : offset+10+int(rdLength)]              // 资源记录数据
-//		offset += int(rdLength)
-//	}
-//}
+func saveToCahce(rbuf []byte) {
+	//fmt.Printf("Now cache size is %d\t\t\r", cache.cnt)
+	offset := 0
+	// Header
+	anCount := int(binary.BigEndian.Uint16(rbuf[6:8]))
+	offset += 12 // header
+	// Request
+	domain, i := parseDomain(rbuf[12:], 0)
+	offset += i // question
+	qtype := binary.BigEndian.Uint16(rbuf[offset : offset+2])
+	offset += 4 // type and class
+	var k DNSCacheKey
+	if qtype == 0x01 {
+		k = DNSCacheKey{
+			domain: domain,
+			v6:     false,
+		}
+	} else if qtype == 0x1c {
+		k = DNSCacheKey{
+			domain: domain,
+			v6:     true,
+		}
+	}
+	cache.Set(k, parseAnswer(rbuf, offset, anCount), config.CacheExpiry)
+	//cache.c.Range(func(key, value any) bool {
+	//	keys := key.(DNSCacheKey)
+	//	values := value.(DNSCache)
+	//	fmt.Println(keys.domain, keys.v6, values.AList)
+	//	return true
+	//})
+}
+
+func parseAnswer(rbuf []byte, offset int, ANCOUNT int) [][]byte {
+	var al [][]byte
+	for i := 0; i < ANCOUNT; i++ {
+		alen := 0
+		_, oi := parseDomain(rbuf, offset)
+		alen += oi
+		rdLength := binary.BigEndian.Uint16(rbuf[offset+alen+8 : offset+alen+10])
+		alen += 10
+		alen += int(rdLength)
+		al = append(al, rbuf[offset:offset+alen])
+		offset += alen
+	}
+	return al
+}
+
+func appendToFile(filename string, data string) error {
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func(f *os.File) {
+		_ = f.Close()
+	}(f)
+
+	_, err = f.WriteString(data)
+	if err != nil {
+		return err
+	}
+	return nil
+}
