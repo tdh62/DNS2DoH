@@ -178,7 +178,7 @@ var config = Config{
 	CacheExpiry:   600,
 }
 
-var cache Cache = Cache{cnt: 0}
+var cache = Cache{cnt: 0}
 
 func main() {
 	log.Println("DNS2DoH version", Version, ",Following", License)
@@ -263,7 +263,9 @@ func loadBanList() {
 		log.Println(err)
 		return
 	}
-	defer fi.Close()
+	defer func(fi *os.File) {
+		_ = fi.Close()
+	}(fi)
 	rd := bufio.NewReader(fi)
 
 	for {
@@ -467,11 +469,11 @@ func handleTCPConn(con net.Conn) {
 		}
 		hit, ok := BanOrCache(buf[:ri])
 		if ok {
-			// build tcp response
-			log.Println(hit)
+			go func() {
+				_, _ = con.Write(addLen(hit))
+			}()
 			continue
 		}
-
 		switch config.ForwardTo {
 		case "DoH":
 			_, err = con.Write(addLen(doDoHRequest(buf[2:ri])))
